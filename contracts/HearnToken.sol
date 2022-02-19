@@ -13,11 +13,17 @@ contract HearnToken is ERC20("HEARN", "HEARN") {
     address constant DEAD = 0x000000000000000000000000000000000000dEaD;
     address constant ZERO = address(0);
     address constant BUSD = 0xe9e7CEA3DedcA5984780Bafc599bD69ADd087D56;
-
+    
     uint16 public MaxLiqFee = 3000; // 30% max
     uint16 public MaxMarketingFee = 3000; // 30% max
 
     mapping(address => bool) private _isExcludedFromFee;
+    mapping(address => bool) private _isExcludedFromAntiBot;
+
+    uint256 public constant MAX_TX_AMOUNT_MIN_LIMIT = 1 ether;
+    uint256 public constant MAX_WALLET_AMOUNT_MIN_LIMIT = 100 ether;
+    uint256 public _maxTxAmount = 10000 ether;
+    uint256 public _maxWalletAmount = 100000 ether;
 
     uint16 public _liquidityFee = 1000; // Fee for Liquidity
     uint16 public _marketingFee = 1000; // Fee for Marketing
@@ -87,6 +93,14 @@ contract HearnToken is ERC20("HEARN", "HEARN") {
         _isExcludedFromFee[DEAD] = true;
         _isExcludedFromFee[ZERO] = true;
         _isExcludedFromFee[address(this)] = true;
+
+        _isExcludedFromAntiBot[_msgSender()] = true;
+        _isExcludedFromAntiBot[DEAD] = true;
+        _isExcludedFromAntiBot[ZERO] = true;
+        _isExcludedFromAntiBot[address(this)] = true;
+        _isExcludedFromAntiBot[address(_swapRouter)] = true;
+        _isExcludedFromAntiBot[address(_hearnBnbPair)] = true;
+        _isExcludedFromAntiBot[address(_hearnBusdPair)] = true;
     }
 
     /**
@@ -130,14 +144,41 @@ contract HearnToken is ERC20("HEARN", "HEARN") {
         );
         emit OperatorTransferred(_operator, newOperator);
         _operator = newOperator;
+        // Exclude new operator from anti bot and fee
+        _isExcludedFromAntiBot[_operator] = true;
+        _isExcludedFromFee[_operator] = true;
     }
 
-    function excludeFromFee(address account) public onlyOwner {
+    function excludeFromFee(address account) external onlyOwner {
         _isExcludedFromFee[account] = true;
     }
 
-    function includeInFee(address account) public onlyOwner {
+    function includeInFee(address account) external onlyOwner {
         _isExcludedFromFee[account] = false;
+    }
+
+    function excludeFromAntiBot(address account) external onlyOwner {
+        _isExcludedFromAntiBot[account] = true;
+    }
+
+    function includeInAntiBot(address account) external onlyOwner {
+        _isExcludedFromAntiBot[account] = false;
+    }
+
+    function setAntiBotConfiguration(
+        uint256 maxTxAmount,
+        uint256 maxWalletAmount
+    ) external onlyOwner {
+        require(
+            maxTxAmount >= MAX_TX_AMOUNT_MIN_LIMIT,
+            "Max tx amount too small"
+        );
+        require(
+            maxWalletAmount >= MAX_WALLET_AMOUNT_MIN_LIMIT,
+            "Max wallet amount too small"
+        );
+        _maxTxAmount = maxTxAmount;
+        _maxWalletAmount = maxWalletAmount;
     }
 
     function setAllFeePercent(uint16 liquidityFee, uint16 marketingFee)
@@ -168,11 +209,23 @@ contract HearnToken is ERC20("HEARN", "HEARN") {
             address(newLiquidifyHelper) != address(0),
             "Invalid liquidify helper"
         );
+
+        // Include old liquidify helper into anti bot
+        if (address(_liquidifyHelper) != address(0)) {
+            _isExcludedFromAntiBot[address(_liquidifyHelper)] = false;
+        }
         _liquidifyHelper = newLiquidifyHelper;
+        // Exclude new liquidify helper from anti bot
+        _isExcludedFromAntiBot[address(_liquidifyHelper)] = true;
     }
 
     function setSwapRouter(address newSwapRouter) external onlyOwner {
         require(newSwapRouter != address(0), "Invalid swap router");
+
+        // Include old router and pairs into anti bot
+        _isExcludedFromAntiBot[address(_swapRouter)] = false;
+        _isExcludedFromAntiBot[address(_hearnBnbPair)] = false;
+        _isExcludedFromAntiBot[address(_hearnBusdPair)] = false;
 
         _swapRouter = IUniswapV2Router02(newSwapRouter);
         _liquidifyHelper.setSwapRouter(newSwapRouter);
@@ -186,6 +239,11 @@ contract HearnToken is ERC20("HEARN", "HEARN") {
             address(this),
             BUSD
         );
+
+        // Exclude new router and pairs from anti bot
+        _isExcludedFromAntiBot[address(_swapRouter)] = false;
+        _isExcludedFromAntiBot[address(_hearnBnbPair)] = false;
+        _isExcludedFromAntiBot[address(_hearnBusdPair)] = false;
     }
 
     function setNumTokensSellToAddToLiquidity(
@@ -198,8 +256,16 @@ contract HearnToken is ERC20("HEARN", "HEARN") {
     //to recieve ETH from swapRouter when swaping
     receive() external payable {}
 
-    function isExcludedFromFee(address account) public view returns (bool) {
+    function isExcludedFromFee(address account) external view returns (bool) {
         return _isExcludedFromFee[account];
+    }
+
+    function isExcludedFromAntiBot(address account)
+        external
+        view
+        returns (bool)
+    {
+        return _isExcludedFromAntiBot[account];
     }
 
     function _transfer(
@@ -210,6 +276,13 @@ contract HearnToken is ERC20("HEARN", "HEARN") {
         require(from != address(0), "ERC20: transfer from zero address");
         require(to != address(0), "ERC20: transfer to zero address");
         require(amount > 0, "Transfer amount must be greater than zero");
+
+        if (!_isExcludedFromAntiBot[from]) {
+            require(amount <= _maxTxAmount, "Too many tokens are going to transferred");
+        }
+        if (!_isExcludedFromAntiBot[to]) {
+            require(balanceOf(to).add(amount) <= _maxWalletAmount, "Too many tokens are going to be stored in target account");
+        }
 
         // is the token balance of this contract address over the min number of
         // tokens that we need to initiate a swap + liquidity lock?
